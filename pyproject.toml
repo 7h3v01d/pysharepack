@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pysharepack"
+version = "0.1.0"
+description = "A safe, dependency-free CLI for packaging Python projects into clean shareable ZIP files."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Leon" }]
+keywords = ["zip", "packaging", "cli", "project", "python", "sharing", "cleanup"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development",
+    "Topic :: System :: Archiving :: Packaging",
+    "Topic :: Utilities",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["build>=1.2", "pytest>=8", "twine>=5"]
+
+[project.scripts]
+pysharepack = "pysharepack.cli:main"
+packproject = "pysharepack.cli:main"
+
+[project.urls]
+Homepage = "https://example.com/pysharepack"
+Repository = "https://example.com/pysharepack"
+Issues = "https://example.com/pysharepack/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
