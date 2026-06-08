@@ -12,7 +12,9 @@ It is designed for Python developers who frequently need to share project folder
 - Keeps tests, docs, logs, media, README files, licenses, requirements files, and existing ZIP archives by default.
 - Excludes common Python/build/editor/cache junk.
 - Skips symlinks by default so archives do not accidentally include linked external content.
-- Optional `--strict` mode for more privacy-sensitive packaging.
+- Supports custom include/exclude overrides.
+- Supports project configuration via `.pysharepack.toml` or `[tool.pysharepack]` in `pyproject.toml`.
+- Supports optional project-root `.gitignore` handling.
 
 ## Install locally
 
@@ -66,6 +68,12 @@ Show excluded items:
 packproject . --dry-run --list-excluded
 ```
 
+Show active rules:
+
+```bash
+packproject . --dry-run --list-rules
+```
+
 Create a custom-named ZIP in a chosen output folder:
 
 ```bash
@@ -83,6 +91,79 @@ Run privacy-sensitive packaging:
 ```bash
 packproject . --strict
 ```
+
+## Custom exclude and include rules
+
+Add extra exclusions:
+
+```bash
+packproject . --exclude "*.log" --exclude "large_data/"
+```
+
+Add include overrides:
+
+```bash
+packproject . --include "*.db"
+```
+
+Include rules are applied after exclusion rules, so they can override exclusions. Symlinks and the output ZIP safety exclusions are still protected.
+
+To re-include a file from a normally excluded directory, target the directory or path explicitly:
+
+```bash
+packproject . --include ".vscode/settings.json"
+```
+
+## Configuration file
+
+Create `.pysharepack.toml` in your project root:
+
+```toml
+[tool.pysharepack]
+name = "my_project_share"
+output = "packaged"
+strict = false
+respect_gitignore = true
+exclude = ["large_data/", "*.bak"]
+include = [".vscode/settings.json"]
+```
+
+You can also place the same section in `pyproject.toml`:
+
+```toml
+[tool.pysharepack]
+exclude = ["scratch/", "*.local"]
+include = ["docs/private_example.md"]
+```
+
+Ignore project config:
+
+```bash
+packproject . --no-config
+```
+
+Use a specific config file:
+
+```bash
+packproject . --config path/to/custom.toml
+```
+
+## Optional `.gitignore` support
+
+Enable project-root `.gitignore` handling:
+
+```bash
+packproject . --respect-gitignore
+```
+
+Or via config:
+
+```toml
+[tool.pysharepack]
+respect_gitignore = true
+```
+
+This is a best-effort implementation, not a full Git engine. It supports common patterns, comments, negation with `!`, directory rules, root-anchored rules, and simple glob matching.
 
 ## Default exclusions
 
@@ -198,11 +279,11 @@ If the output folder is the project root, pysharepack explicitly excludes the ou
 
 ## Limitations
 
-- Does not currently read `.gitignore`.
-- Does not currently support custom `--include` / `--exclude` override patterns.
-- Does not currently preserve symlinks.
+- `.gitignore` support is best-effort and currently reads only the project-root `.gitignore`.
+- It does not currently preserve symlinks.
 - Strict mode is not a secret scanner.
-- Very large projects may benefit from future progress output and custom rule support.
+- Include rules can reopen an excluded directory only when the include rule explicitly targets that directory/path.
+- Very large projects may benefit from future progress output.
 
 ## Build for PyPI
 

@@ -17,37 +17,35 @@ import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable, Literal
 
 from pysharepack import __version__
 
 
-DEFAULT_EXCLUDE_DIR_NAMES = {
-    ".git",
-    ".vscode",
-    ".idea",
-    "__pycache__",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".ruff_cache",
-    ".venv",
-    "venv",
-    "env",
-    "build",
-    "dist",
-    "htmlcov",
-    "node_modules",
-    "__MACOSX",
-    ".tox",
-    ".nox",
-    ".hypothesis",
-}
+Action = Literal["include", "exclude"]
+ItemType = Literal["file", "dir"]
 
-DEFAULT_EXCLUDE_DIR_PATTERNS = {
-    "*.egg-info",
-}
 
-DEFAULT_EXCLUDE_FILE_PATTERNS = {
+DEFAULT_EXCLUDE_PATTERNS = [
+    ".git/",
+    ".vscode/",
+    ".idea/",
+    "__pycache__/",
+    ".pytest_cache/",
+    ".mypy_cache/",
+    ".ruff_cache/",
+    ".venv/",
+    "venv/",
+    "env/",
+    "build/",
+    "dist/",
+    "htmlcov/",
+    "node_modules/",
+    "__MACOSX/",
+    ".tox/",
+    ".nox/",
+    ".hypothesis/",
+    "*.egg-info/",
     "*.pyc",
     "*.pyo",
     ".coverage",
@@ -59,18 +57,15 @@ DEFAULT_EXCLUDE_FILE_PATTERNS = {
     "*.temp",
     ".DS_Store",
     "Thumbs.db",
-}
+]
 
-STRICT_EXCLUDE_DIR_NAMES = {
-    "secrets",
-    "secret",
-    "private",
-    "keys",
-}
-
-STRICT_EXCLUDE_FILE_PATTERNS = {
+STRICT_EXCLUDE_PATTERNS = [
     ".env",
     ".env.*",
+    "secrets/",
+    "secret/",
+    "private/",
+    "keys/",
     "*.key",
     "*.pem",
     "*.crt",
@@ -79,7 +74,7 @@ STRICT_EXCLUDE_FILE_PATTERNS = {
     "config.local.*",
     "secrets.json",
     "secret.json",
-}
+]
 
 CLEAN_DIR_NAMES = {
     "__pycache__",
@@ -92,6 +87,34 @@ CLEAN_FILE_PATTERNS = {
     "*.pyc",
     "*.pyo",
 }
+
+PROTECTED_EXCLUDE_REASONS = {
+    "output directory excluded to avoid self-packaging",
+    "output ZIP excluded to avoid self-packaging",
+}
+
+
+@dataclass(slots=True)
+class Rule:
+    """A packaging rule."""
+
+    pattern: str
+    action: Action
+    source: str
+    order: int
+
+    @property
+    def normalized(self) -> str:
+        return self.pattern.replace("\\", "/")
+
+    @property
+    def dir_only(self) -> bool:
+        return self.normalized.endswith("/")
+
+    @property
+    def is_subtree(self) -> bool:
+        p = self.normalized.rstrip("/")
+        return self.dir_only or p.endswith("/**")
 
 
 @dataclass(slots=True)
@@ -113,6 +136,20 @@ class ScanResult:
     clean_dirs: list[Path] = field(default_factory=list)
     clean_files: list[Path] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    rules: list[Rule] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class Config:
+    """Optional project configuration."""
+
+    path: Path | None = None
+    exclude: list[str] = field(default_factory=list)
+    include: list[str] = field(default_factory=list)
+    strict: bool | None = None
+    respect_gitignore: bool | None = None
+    output: str | None = None
+    name: str | None = None
 
 
 def normalise_rel(path: Path) -> str:
@@ -145,42 +182,181 @@ def same_path(left: Path, right: Path) -> bool:
         return left.absolute() == right.absolute()
 
 
-def should_exclude_dir(dir_name: str, *, strict: bool) -> str | None:
-    """Return the exclusion reason for a directory name, or None."""
-    if dir_name in DEFAULT_EXCLUDE_DIR_NAMES:
-        return f"default directory exclusion: {dir_name}"
-
-    matched = matches_any_pattern(dir_name, DEFAULT_EXCLUDE_DIR_PATTERNS)
-    if matched:
-        return f"default directory pattern: {matched}"
-
-    if strict and dir_name in STRICT_EXCLUDE_DIR_NAMES:
-        return f"strict directory exclusion: {dir_name}"
-
-    return None
+def split_parts(rel_posix: str) -> list[str]:
+    return [p for p in rel_posix.split("/") if p]
 
 
-def should_exclude_file(file_name: str, *, strict: bool) -> str | None:
-    """Return the exclusion reason for a file name, or None."""
-    matched = matches_any_pattern(file_name, DEFAULT_EXCLUDE_FILE_PATTERNS)
-    if matched:
-        return f"default file pattern: {matched}"
+def normalize_pattern(pattern: str) -> str:
+    """Normalize a user/config rule pattern."""
+    return pattern.strip().replace("\\", "/")
 
+
+def strip_gitignore_escape(line: str) -> str:
+    if line.startswith(r"\#") or line.startswith(r"\!"):
+        return line[1:]
+    return line
+
+
+def path_matches_pattern(pattern: str, rel_posix: str, item_type: ItemType) -> bool:
+    """
+    Match a pysharepack/gitignore-ish pattern against a relative POSIX path.
+
+    Supported behavior:
+    - trailing slash means directory/subtree pattern
+    - leading slash anchors to project root
+    - patterns with slashes match relative paths
+    - patterns without slashes match basenames and path components
+    - /** suffix matches an entire subtree
+    """
+    raw = normalize_pattern(pattern)
+    if not raw:
+        return False
+
+    anchored = raw.startswith("/")
+    p = raw[1:] if anchored else raw
+    dir_only = p.endswith("/")
+    p_no_slash = p.rstrip("/")
+
+    if p_no_slash.endswith("/**"):
+        prefix = p_no_slash[:-3].rstrip("/")
+        if anchored:
+            return rel_posix == prefix or rel_posix.startswith(prefix + "/")
+        return any(
+            rel_posix == candidate or rel_posix.startswith(candidate + "/")
+            for candidate in subtree_candidates(prefix, rel_posix)
+        )
+
+    parts = split_parts(rel_posix)
+    name = parts[-1] if parts else rel_posix
+
+    if dir_only:
+        if item_type == "dir" and (fnmatch.fnmatch(name, p_no_slash) or fnmatch.fnmatch(rel_posix, p_no_slash)):
+            return True
+        if anchored:
+            return rel_posix == p_no_slash or rel_posix.startswith(p_no_slash + "/")
+        if "/" in p_no_slash:
+            return rel_posix == p_no_slash or rel_posix.startswith(p_no_slash + "/")
+        return any(fnmatch.fnmatch(part, p_no_slash) for part in parts)
+
+    if anchored:
+        return fnmatch.fnmatch(rel_posix, p)
+
+    if "/" in p:
+        return fnmatch.fnmatch(rel_posix, p) or fnmatch.fnmatch("/" + rel_posix, p)
+
+    return fnmatch.fnmatch(name, p) or any(fnmatch.fnmatch(part, p) for part in parts)
+
+
+def subtree_candidates(prefix: str, rel_posix: str) -> list[str]:
+    """Return possible relative subtree prefixes for an unanchored pattern."""
+    parts = split_parts(rel_posix)
+    prefix_parts = split_parts(prefix)
+    if not parts or not prefix_parts:
+        return [prefix]
+    candidates: list[str] = []
+    for i in range(0, len(parts) - len(prefix_parts) + 1):
+        candidate = "/".join(parts[i : i + len(prefix_parts)])
+        if fnmatch.fnmatch(candidate, prefix):
+            candidates.append("/".join(parts[: i + len(prefix_parts)]))
+    candidates.append(prefix)
+    return candidates
+
+
+def matching_decision(rel_posix: str, item_type: ItemType, rules: list[Rule]) -> tuple[Action | None, Rule | None]:
+    """Return the final matching action and rule. Later rules override earlier rules."""
+    final_action: Action | None = None
+    final_rule: Rule | None = None
+    for rule in rules:
+        if path_matches_pattern(rule.pattern, rel_posix, item_type):
+            final_action = rule.action
+            final_rule = rule
+    return final_action, final_rule
+
+
+def include_may_reopen_dir(rel_posix: str, include_rules: list[Rule]) -> bool:
+    """Return True if an include rule appears to target a pruned directory or its subtree."""
+    if not rel_posix:
+        return True
+    dir_name = rel_posix.split("/")[-1]
+    for rule in include_rules:
+        p = normalize_pattern(rule.pattern).lstrip("/").rstrip("/")
+        p = p[:-3].rstrip("/") if p.endswith("/**") else p
+        if not p:
+            continue
+        if "/" not in p and fnmatch.fnmatch(dir_name, p):
+            return True
+        if p == rel_posix or p.startswith(rel_posix + "/"):
+            return True
+        if fnmatch.fnmatch(rel_posix, p):
+            return True
+    return False
+
+
+def parse_gitignore(project_dir: Path) -> list[Rule]:
+    """Parse the project-root .gitignore into best-effort include/exclude rules."""
+    gitignore = project_dir / ".gitignore"
+    if not gitignore.exists():
+        return []
+
+    rules: list[Rule] = []
+    order = 0
+    for raw_line in gitignore.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.rstrip("\n")
+        if not line.strip():
+            continue
+        line = strip_gitignore_escape(line.strip())
+        if not line or line.startswith("#"):
+            continue
+        action: Action = "exclude"
+        if line.startswith("!"):
+            action = "include"
+            line = line[1:]
+        if not line:
+            continue
+        rules.append(Rule(line, action, ".gitignore", order))
+        order += 1
+    return rules
+
+
+def make_rules(
+    *,
+    strict: bool,
+    respect_gitignore: bool,
+    project_dir: Path,
+    config_exclude: list[str],
+    config_include: list[str],
+    cli_exclude: list[str],
+    cli_include: list[str],
+) -> list[Rule]:
+    """Build ordered packaging rules. Later rules win."""
+    rules: list[Rule] = []
+    order = 0
+
+    def add_many(patterns: Iterable[str], action: Action, source: str) -> None:
+        nonlocal order
+        for pattern in patterns:
+            normalized = normalize_pattern(pattern)
+            if not normalized:
+                continue
+            rules.append(Rule(normalized, action, source, order))
+            order += 1
+
+    add_many(DEFAULT_EXCLUDE_PATTERNS, "exclude", "default")
     if strict:
-        matched = matches_any_pattern(file_name, STRICT_EXCLUDE_FILE_PATTERNS)
-        if matched:
-            return f"strict file pattern: {matched}"
-
-    return None
+        add_many(STRICT_EXCLUDE_PATTERNS, "exclude", "strict")
+    if respect_gitignore:
+        for rule in parse_gitignore(project_dir):
+            rules.append(Rule(rule.pattern, rule.action, rule.source, order))
+            order += 1
+    add_many(config_exclude, "exclude", "config exclude")
+    add_many(config_include, "include", "config include")
+    add_many(cli_exclude, "exclude", "cli exclude")
+    add_many(cli_include, "include", "cli include")
+    return rules
 
 
 def should_exclude_output_dir(root_path: Path, project_dir: Path, output_dir: Path | None) -> bool:
-    """
-    Return True if root_path is the output directory or inside it.
-
-    The project root itself is not excluded when --output points at the project root.
-    In that case only the output ZIP path is excluded explicitly.
-    """
+    """Return True if root_path is the output directory or inside it."""
     if output_dir is None:
         return False
 
@@ -197,8 +373,13 @@ def scan_project(
     project_dir: Path,
     *,
     strict: bool,
+    respect_gitignore: bool = False,
     output_dir: Path | None = None,
     output_zip: Path | None = None,
+    config_exclude: list[str] | None = None,
+    config_include: list[str] | None = None,
+    cli_exclude: list[str] | None = None,
+    cli_include: list[str] | None = None,
 ) -> ScanResult:
     """
     Scan the project and decide what gets included/excluded.
@@ -210,6 +391,22 @@ def scan_project(
     project_dir = project_dir.resolve()
     resolved_output_dir = output_dir.resolve() if output_dir else None
     resolved_output_zip = output_zip.resolve() if output_zip else None
+    config_exclude = config_exclude or []
+    config_include = config_include or []
+    cli_exclude = cli_exclude or []
+    cli_include = cli_include or []
+
+    rules = make_rules(
+        strict=strict,
+        respect_gitignore=respect_gitignore,
+        project_dir=project_dir,
+        config_exclude=config_exclude,
+        config_include=config_include,
+        cli_exclude=cli_exclude,
+        cli_include=cli_include,
+    )
+    result.rules = rules
+    include_rules = [rule for rule in rules if rule.action == "include"]
 
     if resolved_output_dir and is_relative_to(resolved_output_dir, project_dir):
         if same_path(resolved_output_dir, project_dir):
@@ -221,6 +418,12 @@ def scan_project(
                 rel = resolved_output_dir
             result.notes.append(f"Output folder is inside the project and will be excluded: {normalise_rel(rel)}")
 
+    if respect_gitignore:
+        result.notes.append("Respecting project-root .gitignore patterns where supported.")
+
+    if config_exclude or config_include or cli_exclude or cli_include:
+        result.notes.append("Custom include/exclude rules are active; later rules override earlier rules.")
+
     for root, dirs, files in os.walk(project_dir, followlinks=False):
         root_path = Path(root)
 
@@ -229,9 +432,7 @@ def scan_project(
                 rel = root_path.relative_to(project_dir)
             except ValueError:
                 rel = root_path
-            result.excluded.append(
-                Decision(root_path, rel, "output directory excluded to avoid self-packaging")
-            )
+            result.excluded.append(Decision(root_path, rel, "output directory excluded to avoid self-packaging"))
             dirs[:] = []
             continue
 
@@ -239,46 +440,46 @@ def scan_project(
         for dir_name in dirs:
             dir_path = root_path / dir_name
             rel_path = dir_path.relative_to(project_dir)
+            rel_posix = normalise_rel(rel_path)
 
             if dir_path.is_symlink():
-                result.skipped_symlinks.append(
-                    Decision(dir_path, rel_path, "symlink directory skipped")
-                )
+                result.skipped_symlinks.append(Decision(dir_path, rel_path, "symlink directory skipped"))
                 continue
 
             if dir_name in CLEAN_DIR_NAMES:
                 result.clean_dirs.append(dir_path)
 
-            reason = should_exclude_dir(dir_name, strict=strict)
-            if reason:
-                result.excluded.append(Decision(dir_path, rel_path, reason))
-            else:
-                kept_dirs.append(dir_name)
+            action, rule = matching_decision(rel_posix, "dir", rules)
+            if action == "exclude" and rule:
+                if include_may_reopen_dir(rel_posix, include_rules):
+                    kept_dirs.append(dir_name)
+                else:
+                    result.excluded.append(Decision(dir_path, rel_path, f"{rule.source}: {rule.pattern}"))
+                continue
+
+            kept_dirs.append(dir_name)
 
         dirs[:] = kept_dirs
 
         for file_name in files:
             file_path = root_path / file_name
             rel_path = file_path.relative_to(project_dir)
+            rel_posix = normalise_rel(rel_path)
 
             if resolved_output_zip and same_path(file_path, resolved_output_zip):
-                result.excluded.append(
-                    Decision(file_path, rel_path, "output ZIP excluded to avoid self-packaging")
-                )
+                result.excluded.append(Decision(file_path, rel_path, "output ZIP excluded to avoid self-packaging"))
                 continue
 
             if file_path.is_symlink():
-                result.skipped_symlinks.append(
-                    Decision(file_path, rel_path, "symlink file skipped")
-                )
+                result.skipped_symlinks.append(Decision(file_path, rel_path, "symlink file skipped"))
                 continue
 
             if matches_any_pattern(file_name, CLEAN_FILE_PATTERNS):
                 result.clean_files.append(file_path)
 
-            reason = should_exclude_file(file_name, strict=strict)
-            if reason:
-                result.excluded.append(Decision(file_path, rel_path, reason))
+            action, rule = matching_decision(rel_posix, "file", rules)
+            if action == "exclude" and rule:
+                result.excluded.append(Decision(file_path, rel_path, f"{rule.source}: {rule.pattern}"))
             else:
                 result.included_files.append(file_path)
 
@@ -286,11 +487,7 @@ def scan_project(
 
 
 def simulate_cleaned_scan(scan: ScanResult) -> ScanResult:
-    """
-    Return a copy of scan with clean targets removed from package reporting.
-
-    Used for --clean --dry-run so the summary reflects the simulated post-clean state.
-    """
+    """Return a copy of scan with clean targets removed from package reporting."""
     clean_paths = {p.resolve() for p in scan.clean_dirs}
     clean_paths.update(p.resolve() for p in scan.clean_files)
 
@@ -305,6 +502,7 @@ def simulate_cleaned_scan(scan: ScanResult) -> ScanResult:
         clean_dirs=[],
         clean_files=[],
         notes=[*scan.notes, "Clean dry-run: summary reflects package state after simulated cleanup."],
+        rules=scan.rules,
     )
 
 
@@ -395,14 +593,109 @@ def format_bytes(num: int) -> str:
     return f"{num} B"
 
 
+def parse_simple_toml(text: str) -> dict[str, Any]:
+    """Very small fallback parser for simple [tool.pysharepack] config files."""
+    result: dict[str, Any] = {}
+    active = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            active = line.strip("[]") in {"tool.pysharepack", "pysharepack"}
+            continue
+        if not active or "=" not in line:
+            continue
+        key, value = [part.strip() for part in line.split("=", 1)]
+        value = value.split(" #", 1)[0].strip()
+        if value.lower() in {"true", "false"}:
+            result[key] = value.lower() == "true"
+        elif value.startswith("[") and value.endswith("]"):
+            inner = value[1:-1].strip()
+            if not inner:
+                result[key] = []
+            else:
+                items = []
+                for piece in inner.split(","):
+                    piece = piece.strip().strip('"').strip("'")
+                    if piece:
+                        items.append(piece)
+                result[key] = items
+        else:
+            result[key] = value.strip('"').strip("'")
+    return {"tool": {"pysharepack": result}}
+
+
+def read_toml(path: Path) -> dict[str, Any]:
+    """Read TOML using tomllib where available, with a tiny fallback."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    try:
+        import tomllib  # Python 3.11+
+
+        return tomllib.loads(text)
+    except ModuleNotFoundError:
+        return parse_simple_toml(text)
+
+
+def as_str_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    return []
+
+
+def find_config(project_dir: Path, explicit_config: str | None, no_config: bool) -> Config:
+    """Load optional .pysharepack.toml or [tool.pysharepack] config."""
+    if no_config:
+        return Config()
+
+    candidates: list[Path] = []
+    if explicit_config:
+        candidates.append(Path(explicit_config).expanduser())
+    else:
+        candidates.append(project_dir / ".pysharepack.toml")
+        candidates.append(project_dir / "pyproject.toml")
+
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        data = read_toml(candidate)
+        if candidate.name == ".pysharepack.toml":
+            section = data.get("tool", {}).get("pysharepack", data.get("pysharepack", data))
+        else:
+            section = data.get("tool", {}).get("pysharepack")
+        if not isinstance(section, dict):
+            continue
+        return Config(
+            path=candidate,
+            exclude=as_str_list(section.get("exclude")),
+            include=as_str_list(section.get("include")),
+            strict=section.get("strict") if isinstance(section.get("strict"), bool) else None,
+            respect_gitignore=section.get("respect_gitignore") if isinstance(section.get("respect_gitignore"), bool) else None,
+            output=str(section.get("output")) if section.get("output") is not None else None,
+            name=str(section.get("name")) if section.get("name") is not None else None,
+        )
+
+    if explicit_config:
+        print(f"WARNING: config file not found or invalid: {explicit_config}", file=sys.stderr)
+    return Config()
+
+
 def print_summary(
     *,
     project_dir: Path,
     output_zip: Path | None,
     scan: ScanResult,
     strict: bool,
+    respect_gitignore: bool,
     dry_run: bool,
     clean: bool,
+    config: Config,
+    cli_exclude: list[str],
+    cli_include: list[str],
     cleanable_dirs_before: int = 0,
     cleanable_files_before: int = 0,
     cleaned_dirs: int = 0,
@@ -417,7 +710,10 @@ def print_summary(
     print(f"Project:       {project_dir}")
     print(f"Mode:          {'DRY RUN' if dry_run else 'WRITE'}")
     print(f"Strict mode:   {'on' if strict else 'off'}")
+    print(f"Gitignore:     {'on' if respect_gitignore else 'off'}")
     print(f"Clean mode:    {'on' if clean else 'off'}")
+    if config.path:
+        print(f"Config:        {config.path}")
     if output_zip:
         print(f"Output ZIP:    {output_zip}")
 
@@ -426,6 +722,15 @@ def print_summary(
         print("Notes:")
         for note in scan.notes:
             print(f"  - {note}")
+
+    custom_count = len(config.exclude) + len(config.include) + len(cli_exclude) + len(cli_include)
+    if custom_count:
+        print()
+        print("Custom rules:")
+        print(f"  Config exclude: {len(config.exclude)}")
+        print(f"  Config include: {len(config.include)}")
+        print(f"  CLI exclude:    {len(cli_exclude)}")
+        print(f"  CLI include:    {len(cli_include)}")
 
     print()
     print(f"Included files:          {len(scan.included_files)}")
@@ -473,6 +778,14 @@ def print_summary(
     print()
 
 
+def print_rules(rules: list[Rule]) -> None:
+    """Print the active ordered rule set."""
+    print()
+    print("Active rules, in priority order; later rules override earlier rules:")
+    for rule in rules:
+        print(f"  {rule.order:03d} {rule.action.upper():7s} {rule.pattern!r}  ({rule.source})")
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     """Parse CLI arguments."""
     parser = argparse.ArgumentParser(
@@ -481,25 +794,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("project", nargs="?", default=".", help="Project directory to package.")
-    parser.add_argument(
-        "--output",
-        "-o",
-        default=None,
-        help="Output folder for the ZIP. Defaults to a packaged folder beside the project.",
-    )
-    parser.add_argument(
-        "--name",
-        "-n",
-        default=None,
-        help="Custom base name for the ZIP. Timestamp is still appended.",
-    )
+    parser.add_argument("--output", "-o", default=None, help="Output folder for the ZIP.")
+    parser.add_argument("--name", "-n", default=None, help="Custom base name for the ZIP. Timestamp is still appended.")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be included/excluded without creating a ZIP.")
     parser.add_argument("--clean", action="store_true", help="Delete only safe cache junk before packaging.")
-    parser.add_argument("--strict", action="store_true", help="Also exclude private/security-sensitive files like .env and keys.")
+    parser.add_argument("--strict", action=argparse.BooleanOptionalAction, default=None, help="Also exclude private/security-sensitive files like .env and keys.")
+    parser.add_argument("--respect-gitignore", action=argparse.BooleanOptionalAction, default=None, help="Apply project-root .gitignore patterns where supported.")
+    parser.add_argument("--exclude", action="append", default=[], help="Add an extra exclusion pattern. Can be used multiple times.")
+    parser.add_argument("--include", action="append", default=[], help="Add an include override pattern. Later include rules can override exclusions.")
+    parser.add_argument("--config", default=None, help="Path to a .pysharepack.toml-style config file.")
+    parser.add_argument("--no-config", action="store_true", help="Ignore .pysharepack.toml and pyproject.toml configuration.")
     parser.add_argument("--overwrite", action="store_true", help="Allow overwriting an existing ZIP with the same name.")
     parser.add_argument("--list-included", action="store_true", help="Print every included file.")
     parser.add_argument("--list-excluded", action="store_true", help="Print every excluded item.")
     parser.add_argument("--list-skipped", action="store_true", help="Print every skipped symlink.")
+    parser.add_argument("--list-rules", action="store_true", help="Print the active rule set.")
     parser.add_argument("--version", action="version", version=f"pysharepack {__version__}")
     return parser.parse_args(argv)
 
@@ -516,18 +825,34 @@ def run(argv: list[str] | None = None) -> int:
         print(f"ERROR: project path is not a directory: {project_dir}", file=sys.stderr)
         return 2
 
-    if args.output:
-        output_dir = Path(args.output).expanduser().resolve()
+    config = find_config(project_dir, args.config, args.no_config)
+
+    strict = args.strict if args.strict is not None else bool(config.strict)
+    respect_gitignore = args.respect_gitignore if args.respect_gitignore is not None else bool(config.respect_gitignore)
+
+    output_value = args.output or config.output
+    if output_value:
+        output_dir = Path(output_value).expanduser()
+        if not output_dir.is_absolute():
+            output_dir = (project_dir / output_dir).resolve()
+        else:
+            output_dir = output_dir.resolve()
     else:
         output_dir = project_dir.parent / "packaged"
 
-    output_zip = output_dir / build_zip_name(project_dir, args.name)
+    name_value = args.name or config.name
+    output_zip = output_dir / build_zip_name(project_dir, name_value)
 
     scan = scan_project(
         project_dir,
-        strict=args.strict,
+        strict=strict,
+        respect_gitignore=respect_gitignore,
         output_dir=output_dir,
         output_zip=output_zip,
+        config_exclude=config.exclude,
+        config_include=config.include,
+        cli_exclude=args.exclude,
+        cli_include=args.include,
     )
 
     cleanable_dirs_before = len(scan.clean_dirs)
@@ -543,10 +868,18 @@ def run(argv: list[str] | None = None) -> int:
         else:
             scan = scan_project(
                 project_dir,
-                strict=args.strict,
+                strict=strict,
+                respect_gitignore=respect_gitignore,
                 output_dir=output_dir,
                 output_zip=output_zip,
+                config_exclude=config.exclude,
+                config_include=config.include,
+                cli_exclude=args.exclude,
+                cli_include=args.include,
             )
+
+    if args.list_rules:
+        print_rules(scan.rules)
 
     if args.list_included:
         print()
@@ -569,12 +902,7 @@ def run(argv: list[str] | None = None) -> int:
     zip_uncompressed_bytes = 0
     if not args.dry_run:
         try:
-            zip_uncompressed_bytes = create_zip(
-                project_dir,
-                scan.included_files,
-                output_zip,
-                overwrite=args.overwrite,
-            )
+            zip_uncompressed_bytes = create_zip(project_dir, scan.included_files, output_zip, overwrite=args.overwrite)
         except FileExistsError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 3
@@ -586,9 +914,13 @@ def run(argv: list[str] | None = None) -> int:
         project_dir=project_dir,
         output_zip=output_zip,
         scan=scan,
-        strict=args.strict,
+        strict=strict,
+        respect_gitignore=respect_gitignore,
         dry_run=args.dry_run,
         clean=args.clean,
+        config=config,
+        cli_exclude=args.exclude,
+        cli_include=args.include,
         cleanable_dirs_before=cleanable_dirs_before,
         cleanable_files_before=cleanable_files_before,
         cleaned_dirs=cleaned_dirs,

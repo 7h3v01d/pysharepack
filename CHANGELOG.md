@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.0
+
+Configurability release.
+
+- Added `--exclude` for custom exclusion patterns.
+- Added `--include` for include override patterns.
+- Added `.pysharepack.toml` config support.
+- Added `[tool.pysharepack]` support in `pyproject.toml`.
+- Added `--config` and `--no-config`.
+- Added optional `--respect-gitignore` support for project-root `.gitignore` patterns.
+- Added `--list-rules` to inspect active rules and rule precedence.
+- Refactored exclusions into an ordered rule engine where later rules override earlier rules.
+- Preserved 0.1.1 safety behavior: symlinks are skipped, output ZIP safety is protected, and `--clean` remains conservative.
+
 ## 0.1.1
 
 Hardening release.
