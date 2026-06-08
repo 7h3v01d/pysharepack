@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pysharepack"
-version = "0.1.0"
+version = "0.1.1"
 description = "A safe, dependency-free CLI for packaging Python projects into clean shareable ZIP files."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -16,7 +16,6 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
