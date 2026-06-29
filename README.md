@@ -330,4 +330,4 @@ The import package can remain `pysharepack`, but the PyPI project name must be g
 
 ## License
 
-Apache 2.0 - Leon Priest
+Apache 2.0 - Leon Priest.
